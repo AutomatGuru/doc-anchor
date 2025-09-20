@@ -21,7 +21,7 @@ src/
 └── package_name/
     ├── __init__.py
     ├── app.py                  # FastAPI application entry point
-    ├── settings.py             # ConfigCat configuration management
+    ├── settings.py             # Flagsmith configuration management
     ├── html.py                 # Generic HTML utilities (if needed)
     ├── clients/
     │   ├── __init__.py
@@ -59,7 +59,7 @@ fastapi==0.115.0
 uvicorn[standard]==0.30.6
 pydantic==2.8.2
 pydantic-settings==2.3.4
-configcat-client>=9,<10
+flagsmith>=3.0.0
 httpx==0.27.2
 tenacity==9.0.0
 beautifulsoup4==4.12.3
@@ -85,74 +85,111 @@ pre-commit==3.8.0
 - Use `python:3.11-slim` for Docker base images
 - Configure GitHub Actions with `python-version: "3.11"`
 
-## Configuration Management (ConfigCat Only)
+## Configuration Management (Flagsmith Only)
 
 ### Core Principles
 - **NO environment variable fallbacks** in code
-- **ConfigCat as single source of truth** for all runtime configuration
-- **`.env` file contains ONLY**: `CONFIGCAT_SDK_KEY`
+- **Flagsmith as single source of truth** for all runtime configuration
+- **Dual-scope architecture**: MAIN and PROJECT environment keys
+- **Direct REST API calls** for reliable flag retrieval
 - **Fail fast** if required configuration is missing
+
+### Dual Environment Architecture
+- **MAIN_FLAGSMITH_KEY**: Shared/infrastructure settings (database, etc.)
+- **PROJECT_FLAGSMITH_KEY**: Project-specific settings (APIs, business logic)
 
 ### Configuration Pattern
 ```python
 # settings.py
 import os
 from typing import Optional
-from configcatclient import ConfigCatClient
 
-_configcat_client: Optional[ConfigCatClient] = None
+def _get_project_flagsmith_client() -> Optional[str]:
+    return os.getenv("PROJECT_FLAGSMITH_KEY")
 
-def _get_configcat_client() -> Optional[ConfigCatClient]:
-    global _configcat_client
-    if _configcat_client is not None:
-        return _configcat_client
-    sdk_key = os.getenv("CONFIGCAT_SDK_KEY")
-    if not sdk_key:
-        return None
-    return ConfigCatClient.get(sdk_key)
+def _get_main_flagsmith_client() -> Optional[str]:
+    return os.getenv("MAIN_FLAGSMITH_KEY")
 
-def _cc_required(key: str):
-    client = _get_configcat_client()
-    if client is None:
-        raise RuntimeError("CONFIGCAT_SDK_KEY is not configured")
-    value = client.get_value(key, None)
-    if value is None or (isinstance(value, str) and value.strip() == ""):
-        raise RuntimeError(f"Missing ConfigCat key: {key}")
-    return value
+def _flagsmith_required_from(api_key: Optional[str], *, which: str, key: str):
+    if api_key is None:
+        raise RuntimeError(f"{which} Flagsmith API key is not configured")
+
+    try:
+        import requests
+        url = f"https://edge.api.flagsmith.com/api/v1/flags/"
+        headers = {"X-Environment-Key": api_key}
+
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+        flags_data = response.json()
+
+        for flag in flags_data:
+            if flag.get("feature", {}).get("name") == key:
+                if not flag.get("enabled", True):
+                    raise RuntimeError(f"Flagsmith flag disabled in {which}: {key}")
+                flag_value = flag.get("feature_state_value")
+                if flag_value is None or (isinstance(flag_value, str) and flag_value.strip() == ""):
+                    raise RuntimeError(f"Empty Flagsmith flag value in {which}: {key}")
+                return flag_value
+
+        raise RuntimeError(f"Missing Flagsmith flag in {which}: {key}")
+    except Exception as e:
+        if "Missing Flagsmith flag" in str(e) or "Empty Flagsmith flag" in str(e) or "disabled" in str(e):
+            raise
+        raise RuntimeError(f"Failed to get Flagsmith flag {key} from {which}: {str(e)}") from e
 
 class Config:
     @property
     def app_name(self) -> str:
         return "package-name"  # Constant, not configurable
 
-    # Database configuration
+    # Database configuration (MAIN scope)
     @property
     def database_url(self) -> str:
-        return str(_cc_required("database_url"))
+        return str(_flagsmith_required_from(_get_main_flagsmith_client(), which="MAIN", key="database_url"))
 
     @property
     def database_pool_size(self) -> int:
-        return int(_cc_required("database_pool_size"))
+        val = _flagsmith_required_from(_get_main_flagsmith_client(), which="MAIN", key="database_pool_size")
+        return int(val)
 
     @property
     def database_timeout_seconds(self) -> float:
-        return float(_cc_required("database_timeout_seconds"))
+        val = _flagsmith_required_from(_get_main_flagsmith_client(), which="MAIN", key="database_timeout_seconds")
+        return float(val)
+
+    # Project-specific configuration (PROJECT scope)
+    @property
+    def api_key(self) -> str:
+        return str(_flagsmith_required_from(_get_project_flagsmith_client(), which="PROJECT", key="api_key"))
 
 conf = Config()
 ```
 
-### Required ConfigCat Keys
-For every project, configure these keys in ConfigCat:
+### Required Flagsmith Setup
+For every project, configure two Flagsmith environments:
+
+**MAIN Environment** (shared infrastructure):
 - `database_url` (string) - Neon PostgreSQL connection string
 - `database_pool_size` (number) - Connection pool size (default: 5)
 - `database_timeout_seconds` (number) - Query timeout (default: 30)
-- Service-specific keys as needed
+
+**PROJECT Environment** (project-specific):
+- `api_key` (string) - External service API keys
+- Service-specific configuration flags as needed
+
+### Environment Variables
+```bash
+# .env
+MAIN_FLAGSMITH_KEY=your_main_environment_key_here
+PROJECT_FLAGSMITH_KEY=your_project_environment_key_here
+```
 
 ## Database Integration (Neon Cloud)
 
 ### Neon PostgreSQL Setup
 - **Serverless PostgreSQL**: Use Neon as the cloud database provider
-- **Connection strings**: Always from ConfigCat, never hardcoded
+- **Connection strings**: Always from Flagsmith MAIN environment, never hardcoded
 - **Async patterns**: Use asyncpg with SQLAlchemy async engine
 
 ### Database Connection Pattern
@@ -413,8 +450,10 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 # Build-time configuration
-ARG CONFIGCAT_SDK_KEY
-ENV CONFIGCAT_SDK_KEY=${CONFIGCAT_SDK_KEY}
+ARG MAIN_FLAGSMITH_KEY
+ARG PROJECT_FLAGSMITH_KEY
+ENV MAIN_FLAGSMITH_KEY=${MAIN_FLAGSMITH_KEY}
+ENV PROJECT_FLAGSMITH_KEY=${PROJECT_FLAGSMITH_KEY}
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -436,7 +475,7 @@ CMD ["uvicorn", "src.package_name.app:app", "--host", "0.0.0.0", "--port", "8080
 ```
 
 ### Environment Handling
-- **Build args**: For ConfigCat SDK key
+- **Build args**: For Flagsmith environment keys (MAIN and PROJECT)
 - **Runtime env**: Only essential environment variables
 - **No secrets**: Never bake secrets into images
 
@@ -490,7 +529,8 @@ jobs:
           push: false
           tags: package-name:${{ github.sha }}
           build-args: |
-            CONFIGCAT_SDK_KEY=${{ secrets.CONFIGCAT_SDK_KEY }}
+            MAIN_FLAGSMITH_KEY=${{ secrets.MAIN_FLAGSMITH_KEY }}
+            PROJECT_FLAGSMITH_KEY=${{ secrets.PROJECT_FLAGSMITH_KEY }}
 ```
 
 ### Quality Gates
@@ -537,7 +577,8 @@ fmt:
 
 docker-build:
 	docker build -t package-name:local \
-		--build-arg CONFIGCAT_SDK_KEY=$(CONFIGCAT_SDK_KEY) \
+		--build-arg MAIN_FLAGSMITH_KEY=$(MAIN_FLAGSMITH_KEY) \
+		--build-arg PROJECT_FLAGSMITH_KEY=$(PROJECT_FLAGSMITH_KEY) \
 		.
 
 docker-run:
@@ -562,9 +603,9 @@ docker-run:
 - **Production ready**: No TODOs, proper error handling
 
 ### Configuration Management
-- **ConfigCat first**: Always check ConfigCat for configuration
+- **Flagsmith first**: Always check Flagsmith for configuration using dual-environment approach
 - **No fallbacks**: Don't provide environment variable fallbacks
 - **Fail fast**: Raise clear errors for missing configuration
-- **Document keys**: List required ConfigCat keys in README
+- **Document keys**: List required Flagsmith flags in README (MAIN and PROJECT environments)
 
 This document serves as the definitive reference for all seed repository development. Follow these patterns consistently to ensure maintainable, scalable, and production-ready applications.
